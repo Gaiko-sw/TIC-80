@@ -39,8 +39,8 @@
 
 #define MAIN_OFFSET 4
 #define MENU_HEIGHT 10
-#define ANIM 10
-#define PAGE 5
+#define ANIM_TIME 10
+#define PAGE 5                      // how many items to jump on left/right
 #define COVER_WIDTH 140
 #define COVER_HEIGHT 116
 #define COVER_Y 5
@@ -66,6 +66,8 @@ struct SurfItem
     bool coverLoading;
     bool dir;
     bool project;
+
+    char** descriptionLines;
 };
 
 typedef struct
@@ -77,12 +79,21 @@ typedef struct
     void* data;
 } AddMenuItemData;
 
+enum
+{
+    A_SPR = 12,
+    B_SPR = 13,
+    X_SPR = 14,
+    Y_SPR = 15,
+};
+
 static void drawTopToolbar(Surf* surf, s32 x, s32 y)
 {
     tic_mem* tic = surf->tic;
 
     enum{Height = MENU_HEIGHT};
 
+    // Background with 1 pixel underline
     tic_api_rect(tic, x, y, TIC80_WIDTH, Height, tic_color_grey);
     tic_api_rect(tic, x, y + Height, TIC80_WIDTH, 1, tic_color_black);
 
@@ -98,14 +109,15 @@ static void drawTopToolbar(Surf* surf, s32 x, s32 y)
 
     u8 colorkey = 0;
     tiles2ram(tic->ram, &getConfig(surf->studio)->cart->bank0.tiles);
-    tic_api_spr(tic, 12, TipX, y+1, 1, 1, &colorkey, 1, 1, tic_no_flip, tic_no_rotate);
+
+    tic_api_spr(tic, A_SPR, TipX, y+1, 1, 1, &colorkey, 1, 1, tic_no_flip, tic_no_rotate);
     {
         static const char Label[] = "SELECT";
         tic_api_print(tic, Label, TipX + Gap, y+3, tic_color_black, true, 1, false);
         tic_api_print(tic, Label, TipX + Gap, y+2, tic_color_white, true, 1, false);
     }
 
-    tic_api_spr(tic, 13, TipX + SelectWidth, y + 1, 1, 1, &colorkey, 1, 1, tic_no_flip, tic_no_rotate);
+    tic_api_spr(tic, B_SPR, TipX + SelectWidth, y + 1, 1, 1, &colorkey, 1, 1, tic_no_flip, tic_no_rotate);
     {
         static const char Label[] = "BACK";
         tic_api_print(tic, Label, TipX + Gap + SelectWidth, y +3, tic_color_black, true, 1, false);
@@ -124,8 +136,11 @@ static void drawBottomToolbar(Surf* surf, s32 x, s32 y)
 
     enum{Height = MENU_HEIGHT};
 
+    // Background with 1 pixel 'overline'
+    tic_api_rect(tic, x, y-1, TIC80_WIDTH, 1, tic_color_black);
     tic_api_rect(tic, x, y, TIC80_WIDTH, Height, tic_color_grey);
-    tic_api_rect(tic, x, y + Height, TIC80_WIDTH, 1, tic_color_black);
+
+    // Write directory & cart name
     {
         char label[TICNAME_MAX + 1];
         char dir[TICNAME_MAX];
@@ -139,6 +154,7 @@ static void drawBottomToolbar(Surf* surf, s32 x, s32 y)
     }
 
 #ifdef CAN_OPEN_URL 
+    // Draw open website button prompt if available (cart has hash)
 
     if(surf->menu.count > 0 && getMenuItem(surf)->hash)
     {
@@ -147,7 +163,7 @@ static void drawBottomToolbar(Surf* surf, s32 x, s32 y)
         u8 colorkey = 0;
 
         tiles2ram(tic->ram, &getConfig(surf->studio)->cart->bank0.tiles);
-        tic_api_spr(tic, 15, TipX + SelectWidth, y + 1, 1, 1, &colorkey, 1, 1, tic_no_flip, tic_no_rotate);
+        tic_api_spr(tic, X_SPR, TipX + SelectWidth, y + 1, 1, 1, &colorkey, 1, 1, tic_no_flip, tic_no_rotate);
         {
             static const char Label[] = "WEBSITE";
             tic_api_print(tic, Label, TipX + Gap + SelectWidth, y + 3, tic_color_black, true, 1, false);
@@ -158,23 +174,105 @@ static void drawBottomToolbar(Surf* surf, s32 x, s32 y)
 
 }
 
+static void stringSlice(char* str, char* out_slice, size_t start, size_t end) {
+    for (size_t i = start; i <= end; ++i)
+    {
+        out_slice[i] = str[i];
+    }
+    out_slice[end] = 0;
+}
+
+static void getWrappedSubstrings(char** out_substrings, char* text, u32 charsPerLine)
+{
+    bool done = false;
+    int prev_slice_index = 0;
+    int currentLine = 0;
+
+    while (!done) {
+        int next_slice_index = prev_slice_index + charsPerLine;
+        if (next_slice_index > strlen(text)) {
+            next_slice_index = sizeof(text);
+            stringSlice(text, out_substrings[currentLine], prev_slice_index, next_slice_index);
+            break;
+        }
+
+        int backup_slice = next_slice_index;
+        while (text[next_slice_index] != ' ') {
+            // There's no space in the whole line. Just use hard limit
+            if (next_slice_index == prev_slice_index) {
+                next_slice_index = backup_slice;
+                break;
+            }
+            next_slice_index--;
+        }
+        stringSlice(text, out_substrings[currentLine], prev_slice_index, next_slice_index);
+
+        currentLine++;
+        prev_slice_index = next_slice_index;
+    }
+    currentLine++;
+    out_substrings[currentLine] = 0;
+}
+
 static void drawMenu(Surf* surf, s32 x, s32 y)
 {
     tic_mem* tic = surf->tic;
 
     enum {Height = MENU_HEIGHT};
 
-    tic_api_rect(tic, 0, y + (MENU_HEIGHT - surf->anim.val.menuHeight) / 2, TIC80_WIDTH, surf->anim.val.menuHeight, tic_color_red);
+    // Selection background
+    tic_api_rect(tic, 0, y + (MENU_HEIGHT - surf->anim.val.menuHeight) / 2, TIC80_WIDTH*2/5, surf->anim.val.menuHeight, tic_color_red);
 
-    s32 ym = y - surf->menu.pos * MENU_HEIGHT + (MENU_HEIGHT - TIC_FONT_HEIGHT) / 2 - surf->anim.val.pos;
-    for(s32 i = 0; i < surf->menu.count; i++, ym += Height)
+    // Cart image
+    // todo
+    // Description
+    s32 y_item = y - (surf->menu.pos * MENU_HEIGHT) + (MENU_HEIGHT - TIC_FONT_HEIGHT) / 2;
+
+    s32 descriptionWidth = TIC80_WIDTH * 3/5;
+    s32 descriptionHeight = TIC80_HEIGHT / 2;
+    enum{CharWidth = 8, LineHeight = 8};
+    u32 charsPerLine = descriptionWidth / CharWidth;
+    u32 maxLines = descriptionHeight / LineHeight;
+    // char substrs[maxLines][charsPerLine];
+    char** substrs = malloc(maxLines * sizeof(char*));
+    for (int i = 0; i < maxLines; i++) {
+        substrs[i] = (char*)malloc(charsPerLine);
+    }
+
+    descriptionWidth;
+    descriptionHeight;
+    getWrappedSubstrings(
+        substrs,
+        "A simple paragraph of text, to be used in testing the description field.",
+        charsPerLine
+    );
+
+    int line_height = 10;
+
+    int i = 0;
+    char* str = substrs[0];
+    while (str != 0) {
+        tic_api_print(tic, substrs[i], TIC80_WIDTH * 2 / 5 + 2, y_item + (i * line_height), tic_color_white, false, 1, false);
+        i++;
+        str = substrs[i];
+    }
+
+    // for (int i = 0; i < maxLines; i++) {
+    //     free(substrs[i]);
+    // }
+    // free(substrs);
+
+    y_item -= surf->anim.val.pos;
+
+    // For each item, move down by Height and draw text
+    for(s32 i = 0; i < surf->menu.count; i++, y_item += Height)
     {
         const char* name = surf->menu.items[i].label;
 
-        if (ym > (-(TIC_FONT_HEIGHT + 1)) && ym <= TIC80_HEIGHT) 
+        if (y_item > (-(TIC_FONT_HEIGHT + 1)) && y_item <= TIC80_HEIGHT) 
         {
-            tic_api_print(tic, name, x + MAIN_OFFSET, ym + 1, tic_color_black, false, 1, false);
-            tic_api_print(tic, name, x + MAIN_OFFSET, ym, tic_color_white, false, 1, false);
+            tic_api_print(tic, name, x + MAIN_OFFSET, y_item + 1, tic_color_black, false, 1, false);
+            tic_api_print(tic, name, x + MAIN_OFFSET, y_item, tic_color_white, false, 1, false);
         }
     }
 }
@@ -189,7 +287,6 @@ static bool addMenuItem(const char* name, const char* title, const char* hash, s
     AddMenuItemData* data = (AddMenuItemData*)ptr;
 
     static const char CartExt[] = CART_EXT;
-
     if(dir 
         || tic_tool_has_ext(name, CartExt)
         || tic_tool_has_ext(name, PngExt)
@@ -504,12 +601,17 @@ static void onGoBackDir(void* data)
     initItemsAsync(surf, onGoBackDirDone, MOVE(goBackDirDoneData));
 }
 
+/// @brief Resets animation after directory loaded. 
+/// @param data 
 static void onGoToDirDone(void* data)
 {
     Surf* surf = data;
     surf->anim.movie = resetMovie(&surf->anim.gotodir.show);
 }
 
+/// @brief Changes directory with tic_fs_changedir. Called from ondone callback
+/// in gotodir animation
+/// @param data 
 static void onGoToDir(void* data)
 {
     Surf* surf = data;
@@ -527,26 +629,25 @@ static void goBackDir(Surf* surf)
     if(strcmp(dir, "") != 0)
     {
         playSystemSfx(surf->studio, 2);
-
         surf->anim.movie = resetMovie(&surf->anim.goback.hide);
     }
 }
 
-static void changeDirectory(Surf* surf, const char* name)
+/// @brief Starts gotodir animation, which will call onGoToDir ondone, changing
+/// dir. Directory name will be picked up from getMenuItem(surf)
+/// @param surf 
+/// @param name 
+static void changeDirectory(Surf* surf)
 {
-    if (strcmp(name, "..") == 0)
-    {
-        goBackDir(surf);
-    }
-    else
-    {
-        playSystemSfx(surf->studio, 2);
-        surf->anim.movie = resetMovie(&surf->anim.gotodir.hide);
-    }
+    playSystemSfx(surf->studio, 2);
+    surf->anim.movie = resetMovie(&surf->anim.gotodir.hide);
 }
 
+/// @brief Saves current downloaded cart. Will mkdir if necessary
+/// @param surf 
 static void autoSave(Surf* surf)
 {
+    // todo get save_directory from one place, as console also has it hardcoded
     const char* save_directory = "/downloads";
     const char* cart_name = surf->console->rom.name;
 
@@ -558,6 +659,8 @@ static void autoSave(Surf* surf)
     forceAutoSave(surf->console, cart_name);
 }
 
+/// @brief Saves cart locally if enabled, then passes to sudio::runGame
+/// @param data Surf struct
 static void onCartLoaded(void* data)
 {
     Surf* surf = data;
@@ -570,6 +673,10 @@ static void onCartLoaded(void* data)
     runGame(surf->studio);
 }
 
+/// @brief 
+/// @param studio 
+/// @param yes Whether the user confirmed action. Aborts if false
+/// @param data Surf struct
 static void onLoadCommandConfirmed(Studio* studio, bool yes, void* data)
 {
     if(yes)
@@ -685,9 +792,15 @@ static void processGamepad(Surf* surf)
             || ticEnterWasPressed(tic, -1, -1))
         {
             SurfItem* item = getMenuItem(surf);
-            item->dir 
-                ? changeDirectory(surf, item->name) 
-                : loadCart(surf);
+            if (item->dir) {
+                if (strcmp(item->name, "..") == 0) {
+                    goBackDir(surf);
+                } else {
+                  changeDirectory(surf);
+                }
+            } else {
+                loadCart(surf);
+            }
         }
 
         if(tic_api_btnp(tic, B, -1, -1)
@@ -864,53 +977,53 @@ void initSurf(Surf* surf, Studio* studio, struct Console* console)
         {
             .idle = {.done = emptyDone,},
 
-            .show = MOVIE_DEF(ANIM, setIdle,
+            .show = MOVIE_DEF(ANIM_TIME, setIdle,
             {
-                {0, MENU_HEIGHT, ANIM, &surf->anim.val.topBarY, AnimEaseIn},
-                {0, MENU_HEIGHT, ANIM, &surf->anim.val.bottomBarY, AnimEaseIn},
-                {-TIC80_WIDTH, 0, ANIM, &surf->anim.val.menuX, AnimEaseIn},
-                {0, MENU_HEIGHT, ANIM, &surf->anim.val.menuHeight, AnimEaseIn},
-                {COVER_FADEOUT, COVER_FADEIN, ANIM, &surf->anim.val.coverFade, AnimEaseIn},
+                {0, MENU_HEIGHT, ANIM_TIME, &surf->anim.val.topBarY, AnimEaseIn},
+                {0, MENU_HEIGHT, ANIM_TIME, &surf->anim.val.bottomBarY, AnimEaseIn},
+                {-TIC80_WIDTH, 0, ANIM_TIME, &surf->anim.val.menuX, AnimEaseIn},
+                {0, MENU_HEIGHT, ANIM_TIME, &surf->anim.val.menuHeight, AnimEaseIn},
+                {COVER_FADEOUT, COVER_FADEIN, ANIM_TIME, &surf->anim.val.coverFade, AnimEaseIn},
             }),
 
-            .play = MOVIE_DEF(ANIM, onPlayCart,
+            .play = MOVIE_DEF(ANIM_TIME, onPlayCart,
             {
-                {MENU_HEIGHT, 0, ANIM, &surf->anim.val.topBarY, AnimEaseIn},
-                {MENU_HEIGHT, 0, ANIM, &surf->anim.val.bottomBarY, AnimEaseIn},
-                {0, -TIC80_WIDTH, ANIM, &surf->anim.val.menuX, AnimEaseIn},
-                {MENU_HEIGHT, 0, ANIM, &surf->anim.val.menuHeight, AnimEaseIn},
-                {COVER_FADEIN, COVER_FADEOUT, ANIM, &surf->anim.val.coverFade, AnimEaseIn},
+                {MENU_HEIGHT, 0, ANIM_TIME, &surf->anim.val.topBarY, AnimEaseIn},
+                {MENU_HEIGHT, 0, ANIM_TIME, &surf->anim.val.bottomBarY, AnimEaseIn},
+                {0, -TIC80_WIDTH, ANIM_TIME, &surf->anim.val.menuX, AnimEaseIn},
+                {MENU_HEIGHT, 0, ANIM_TIME, &surf->anim.val.menuHeight, AnimEaseIn},
+                {COVER_FADEIN, COVER_FADEOUT, ANIM_TIME, &surf->anim.val.coverFade, AnimEaseIn},
             }),
 
             .move = MOVIE_DEF(9, moveDone, {{0, 0, 9, &surf->anim.val.pos, AnimLinear}}),
 
             .gotodir = 
             {
-                .show = MOVIE_DEF(ANIM, setIdle,
+                .show = MOVIE_DEF(ANIM_TIME, setIdle,
                 {
-                    {TIC80_WIDTH, 0, ANIM, &surf->anim.val.menuX, AnimEaseIn},
-                    {0, MENU_HEIGHT, ANIM, &surf->anim.val.menuHeight, AnimEaseIn},
+                    {TIC80_WIDTH, 0, ANIM_TIME, &surf->anim.val.menuX, AnimEaseIn},
+                    {0, MENU_HEIGHT, ANIM_TIME, &surf->anim.val.menuHeight, AnimEaseIn},
                 }),
 
-                .hide = MOVIE_DEF(ANIM, onGoToDir,
+                .hide = MOVIE_DEF(ANIM_TIME, onGoToDir,
                 {
-                    {0, -TIC80_WIDTH, ANIM, &surf->anim.val.menuX, AnimEaseIn},
-                    {MENU_HEIGHT, 0, ANIM, &surf->anim.val.menuHeight, AnimEaseIn},
+                    {0, -TIC80_WIDTH, ANIM_TIME, &surf->anim.val.menuX, AnimEaseIn},
+                    {MENU_HEIGHT, 0, ANIM_TIME, &surf->anim.val.menuHeight, AnimEaseIn},
                 }),
             },
 
             .goback = 
             {
-                .show = MOVIE_DEF(ANIM, setIdle,
+                .show = MOVIE_DEF(ANIM_TIME, setIdle,
                 {
-                    {-TIC80_WIDTH, 0, ANIM, &surf->anim.val.menuX, AnimEaseIn},
-                    {0, MENU_HEIGHT, ANIM, &surf->anim.val.menuHeight, AnimEaseIn},
+                    {-TIC80_WIDTH, 0, ANIM_TIME, &surf->anim.val.menuX, AnimEaseIn},
+                    {0, MENU_HEIGHT, ANIM_TIME, &surf->anim.val.menuHeight, AnimEaseIn},
                 }),
 
-                .hide = MOVIE_DEF(ANIM, onGoBackDir,
+                .hide = MOVIE_DEF(ANIM_TIME, onGoBackDir,
                 {
-                    {0, TIC80_WIDTH, ANIM, &surf->anim.val.menuX, AnimEaseIn},
-                    {MENU_HEIGHT, 0, ANIM, &surf->anim.val.menuHeight, AnimEaseIn},
+                    {0, TIC80_WIDTH, ANIM_TIME, &surf->anim.val.menuX, AnimEaseIn},
+                    {MENU_HEIGHT, 0, ANIM_TIME, &surf->anim.val.menuHeight, AnimEaseIn},
                 }),
             },
         },
